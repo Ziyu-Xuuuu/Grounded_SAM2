@@ -1,0 +1,18 @@
+# vrx_buoy.yaml
+
+# 数据集根目录（用绝对路径最稳）
+path: /home/multy-surya/Grounded-SAM-2/vrx_yolo11_dataset
+
+train: images/train
+val: images/val
+
+nc: 7   # 类别数
+
+names:
+  0: boat
+  1: red_cone_buoy
+  2: black_cone_buoy
+  3: green_cone_buoy
+  4: gray_cone_buoy
+  5: orange_sphere_buoy
+  6: black_sphere_buoy

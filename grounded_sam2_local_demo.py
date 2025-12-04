@@ -10,20 +10,43 @@ from torchvision.ops import box_convert
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 from grounding_dino.groundingdino.util.inference import load_model, load_image, predict
-
+import time
 """
 Hyper parameters
 """
-TEXT_PROMPT = "car. tire."
-IMG_PATH = "notebooks/images/truck.jpg"
+# TEXT_PROMPT = (
+#     "floating vegetation. floating green mats. large floating vegetation patches. "
+#     "floating algae. large green patches on water. water surface. shoreline vegetation. trees. sky."
+# )
+# TEXT_PROMPT = (
+#     "small floating vegetation. floating algae fragments. scattered floating leaves. "
+#     "thin green strips on water. small floating patches. floating debris. floating vegetation mats. "
+#     "floating algae. water surface. shoreline vegetation. trees. sky."
+# )
+# TEXT_PROMPT = (
+#     "floating vegetation. floating algae. small floating green fragments. "
+#     "tiny green patches on water. scattered floating debris. thin floating leaves. "
+#     "color-different patches on water surface. floating reflection noise. water surface. shoreline vegetation. trees. sky."
+# )
+TEXT_PROMPT = (
+    "floating vegetation. floating algae. scattered floating fragments. "
+    "small floating patches. irregular floating mats. thin floating leaves. "
+    "dispersed objects floating on water surface. "
+    "open water surface. smooth water background. "
+    "shoreline vegetation. trees. sky."
+)
+
+
+
+IMG_PATH = "./field_test_dataset/2025-10-16 09-24-42.png"
 SAM2_CHECKPOINT = "./checkpoints/sam2.1_hiera_large.pt"
 SAM2_MODEL_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 GROUNDING_DINO_CONFIG = "grounding_dino/groundingdino/config/GroundingDINO_SwinT_OGC.py"
 GROUNDING_DINO_CHECKPOINT = "gdino_checkpoints/groundingdino_swint_ogc.pth"
-BOX_THRESHOLD = 0.35
-TEXT_THRESHOLD = 0.25
+BOX_THRESHOLD = 0.2#0.35
+TEXT_THRESHOLD = 0.15
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-OUTPUT_DIR = Path("outputs/grounded_sam2_local_demo")
+OUTPUT_DIR = Path("./field_test_dataset/output")
 DUMP_JSON_RESULTS = True
 
 # create output directory
@@ -50,7 +73,7 @@ grounding_model = load_model(
 # VERY important: text queries need to be lowercased + end with a dot
 text = TEXT_PROMPT
 img_path = IMG_PATH
-
+start_time = time.time()
 image_source, image = load_image(img_path)
 
 sam2_predictor.set_image(image_source)
@@ -62,7 +85,9 @@ boxes, confidences, labels = predict(
     box_threshold=BOX_THRESHOLD,
     text_threshold=TEXT_THRESHOLD,
 )
-
+end_time = time.time()
+print("gdino time: ", end_time - start_time)
+start_time = time.time()
 # process the box prompt for SAM 2
 h, w, _ = image_source.shape
 boxes = boxes * torch.Tensor([w, h, w, h])
@@ -83,7 +108,8 @@ masks, scores, logits = sam2_predictor.predict(
     box=input_boxes,
     multimask_output=False,
 )
-
+end_time = time.time()
+print("sam2 time: ", end_time - start_time)
 """
 Post-process the output of the model to get the masks, scores, and logits for visualization
 """

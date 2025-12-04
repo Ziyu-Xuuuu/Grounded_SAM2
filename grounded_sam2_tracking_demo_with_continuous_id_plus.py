@@ -13,6 +13,8 @@ from utils.common_utils import CommonUtils
 from utils.mask_dictionary_model import MaskDictionaryModel, ObjectInfo
 import json
 import copy
+import pandas as pd
+import matplotlib.pyplot as plt
 
 # This demo shows the continuous object tracking plus reverse tracking with Grounding DINO and SAM 2
 """
@@ -45,14 +47,27 @@ grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).
 
 # setup the input image and text prompt for SAM 2 and Grounding DINO
 # VERY important: text queries need to be lowercased + end with a dot
-text = "car."
+text = (
+    "red cone buoy. green cone buoy. gray cone buoy. black cone buoy. "
+    "black sphere buoy. orange sphere buoy. "
+    "red buoy. green buoy. gray buoy. black buoy. orange buoy. "
+    "cone buoy. sphere buoy. cylindrical buoy. "
+    "navigation buoy. marker buoy. floating buoy. marine buoy. "
+    "red navigation marker. green navigation marker. black navigation marker. "
+    "floating marker. marine marker. water marker. "
+    "buoy. marker. float. navigation aid. "
+    "red float. green float. black float. orange float. "
+    "marine equipment. navigation equipment. floating object. "
+    "boat. ship. vessel. "
+    "dock. pier. rocks. water. lake. sea. sky."
+)
 
 # `video_dir` a directory of JPEG frames with filenames like `<frame_index>.jpg`  
-video_dir = "notebooks/videos/car"
+video_dir = "vrx_demo"
 # 'output_dir' is the directory to save the annotated frames
-output_dir = "outputs"
+output_dir = "vrx_demo_outputs"
 # 'output_video_path' is the path to save the final video
-output_video_path = "./outputs/output.mp4"
+output_video_path = "./vrx_demo_outputs/vrx_tracking_demo.mp4"
 # create the output directory
 mask_data_dir = os.path.join(output_dir, "mask_data")
 json_data_dir = os.path.join(output_dir, "json_data")
@@ -69,6 +84,9 @@ frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
 # init video predictor state
 inference_state = video_predictor.init_state(video_path=video_dir)
 step = 20 # the step to sample frames for Grounding DINO predictor
+
+# Initialize confidence tracking
+confidence_data = []  # Store confidence data over time
 
 sam2_masks = MaskDictionaryModel()
 PROMPT_TYPE_FOR_VIDEO = "mask" # box, mask or point
@@ -105,6 +123,7 @@ for start_frame_idx in range(0, len(frame_names), step):
 
     # process the detection results
     input_boxes = results[0]["boxes"] # .cpu().numpy()
+    detection_scores = results[0]["scores"]  # Get detection confidence scores
     # print("results[0]",results[0])
     OBJECTS = results[0]["labels"]
     if input_boxes.shape[0] != 0:
@@ -130,6 +149,17 @@ for start_frame_idx in range(0, len(frame_names), step):
         # If you are using point prompts, we uniformly sample positive points based on the mask
         if mask_dict.promote_type == "mask":
             mask_dict.add_new_frame_annotation(mask_list=torch.tensor(masks).to(device), box_list=torch.tensor(input_boxes), label_list=OBJECTS)
+            
+            # Collect confidence data for initial detection
+            for i, (det_score, sam_score, obj_label) in enumerate(zip(detection_scores, scores, OBJECTS)):
+                confidence_data.append({
+                    'frame_idx': start_frame_idx,
+                    'object_id': objects_count + i + 1,
+                    'object_class': obj_label,
+                    'detection_confidence': float(det_score),
+                    'sam_confidence': float(sam_score),
+                    'tracking_type': 'initial_detection'
+                })
         else:
             raise NotImplementedError("SAM 2 video predictor only support mask prompts")
     else:
@@ -164,13 +194,30 @@ for start_frame_idx in range(0, len(frame_names), step):
             
             for i, out_obj_id in enumerate(out_obj_ids):
                 out_mask = (out_mask_logits[i] > 0.0) # .cpu().numpy()
-                object_info = ObjectInfo(instance_id = out_obj_id, mask = out_mask[0], class_name = mask_dict.get_target_class_name(out_obj_id), logit=mask_dict.get_target_logit(out_obj_id))
+                mask_confidence = torch.max(out_mask_logits[i]).item()  # Get max logit as confidence
+                object_class = mask_dict.get_target_class_name(out_obj_id)
+                
+                if out_mask.sum() == 0:
+                    print(f"no mask for object {out_obj_id} ({object_class}) at frame {out_frame_idx}")
+                    continue
+                    
+                object_info = ObjectInfo(instance_id = out_obj_id, mask = out_mask[0], class_name = object_class, logit=mask_dict.get_target_logit(out_obj_id))
                 object_info.update_box()
                 frame_masks.labels[out_obj_id] = object_info
                 image_base_name = frame_names[out_frame_idx].split(".")[0]
                 frame_masks.mask_name = f"mask_{image_base_name}.npy"
                 frame_masks.mask_height = out_mask.shape[-2]
                 frame_masks.mask_width = out_mask.shape[-1]
+                
+                # Collect confidence data for tracking
+                confidence_data.append({
+                    'frame_idx': out_frame_idx,
+                    'object_id': out_obj_id,
+                    'object_class': object_class,
+                    'mask_confidence': mask_confidence,
+                    'mask_area': int(out_mask.sum()),
+                    'tracking_type': 'propagation'
+                })
 
             video_segments[out_frame_idx] = frame_masks
             sam2_masks = copy.deepcopy(frame_masks)
@@ -199,6 +246,9 @@ start_object_id = 0
 object_info_dict = {}
 for frame_idx, current_object_count in frame_object_count.items():
     print("reverse tracking frame", frame_idx, frame_names[frame_idx])
+    print(f"Debug: start_object_id={start_object_id}, current_object_count={current_object_count}")
+    
+    masks_added = False
     if frame_idx != 0:
         video_predictor.reset_state(inference_state)
         image_base_name = frame_names[frame_idx].split(".")[0]
@@ -206,34 +256,41 @@ for frame_idx, current_object_count in frame_object_count.items():
         json_data = MaskDictionaryModel().from_json(json_data_path)
         mask_data_path = os.path.join(mask_data_dir, f"mask_{image_base_name}.npy")
         mask_array = np.load(mask_data_path)
+        
         for object_id in range(start_object_id+1, current_object_count+1):
-            print("reverse tracking object", object_id)
+            object_class = json_data.labels[object_id].class_name
+            print(f"reverse tracking object {object_id} ({object_class})")
             object_info_dict[object_id] = json_data.labels[object_id]
             video_predictor.add_new_mask(inference_state, frame_idx, object_id, mask_array == object_id)
+            masks_added = True
+    
     start_object_id = current_object_count
         
     
-    for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state, max_frame_num_to_track=step*2,  start_frame_idx=frame_idx, reverse=True):
-        image_base_name = frame_names[out_frame_idx].split(".")[0]
-        json_data_path = os.path.join(json_data_dir, f"mask_{image_base_name}.json")
-        json_data = MaskDictionaryModel().from_json(json_data_path)
-        mask_data_path = os.path.join(mask_data_dir, f"mask_{image_base_name}.npy")
-        mask_array = np.load(mask_data_path)
-        # merge the reverse tracking masks with the original masks
-        for i, out_obj_id in enumerate(out_obj_ids):
-            out_mask = (out_mask_logits[i] > 0.0).cpu()
-            if out_mask.sum() == 0:
-                print("no mask for object", out_obj_id, "at frame", out_frame_idx)
-                continue
-            object_info = object_info_dict[out_obj_id]
-            object_info.mask = out_mask[0]
-            object_info.update_box()
-            json_data.labels[out_obj_id] = object_info
-            mask_array = np.where(mask_array != out_obj_id, mask_array, 0)
-            mask_array[object_info.mask] = out_obj_id
-        
-        np.save(mask_data_path, mask_array)
-        json_data.to_json(json_data_path)
+    # Only propagate if we have added masks
+    if masks_added:
+        for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state, max_frame_num_to_track=step*2,  start_frame_idx=frame_idx, reverse=True):
+            image_base_name = frame_names[out_frame_idx].split(".")[0]
+            json_data_path = os.path.join(json_data_dir, f"mask_{image_base_name}.json")
+            json_data = MaskDictionaryModel().from_json(json_data_path)
+            mask_data_path = os.path.join(mask_data_dir, f"mask_{image_base_name}.npy")
+            mask_array = np.load(mask_data_path)
+            # merge the reverse tracking masks with the original masks
+            for i, out_obj_id in enumerate(out_obj_ids):
+                out_mask = (out_mask_logits[i] > 0.0).cpu()
+                if out_mask.sum() == 0:
+                    object_class = object_info_dict[out_obj_id].class_name if out_obj_id in object_info_dict else "unknown"
+                    print(f"no mask for object {out_obj_id} ({object_class}) at frame {out_frame_idx}")
+                    continue
+                object_info = object_info_dict[out_obj_id]
+                object_info.mask = out_mask[0]
+                object_info.update_box()
+                json_data.labels[out_obj_id] = object_info
+                mask_array = np.where(mask_array != out_obj_id, mask_array, 0)
+                mask_array[object_info.mask] = out_obj_id
+            
+            np.save(mask_data_path, mask_array)
+            json_data.to_json(json_data_path)
 
         
 
@@ -245,3 +302,170 @@ Step 6: Draw the results and save the video
 CommonUtils.draw_masks_and_box_with_supervision(video_dir, mask_data_dir, json_data_dir, result_dir+"_reverse")
 
 create_video_from_images(result_dir, output_video_path, frame_rate=15)
+
+print("Analyzing confidence data...")
+
+# Convert confidence data to DataFrame for analysis
+if confidence_data:
+    df = pd.DataFrame(confidence_data)
+    
+    # Save confidence data to CSV
+    confidence_csv_path = os.path.join(output_dir, "confidence_analysis.csv")
+    df.to_csv(confidence_csv_path, index=False)
+    print(f"Confidence data saved to: {confidence_csv_path}")
+    
+    # Filter data to only show buoy objects (include all buoy-related prompts)
+    buoy_classes = [
+        # Original specific buoys
+        "red cone buoy", "green cone buoy", "gray cone buoy", "black cone buoy", 
+        "black sphere buoy", "orange sphere buoy",
+        # Color-only buoys
+        "red buoy", "green buoy", "gray buoy", "black buoy", "orange buoy",
+        # Shape-only buoys  
+        "cone buoy", "sphere buoy", "cylindrical buoy",
+        # Navigation buoys
+        "navigation buoy", "marker buoy", "floating buoy", "marine buoy",
+        # Navigation markers
+        "red navigation marker", "green navigation marker", "black navigation marker",
+        "floating marker", "marine marker", "water marker",
+        # Generic terms
+        "buoy", "marker", "float", "navigation aid",
+        # Color floats
+        "red float", "green float", "black float", "orange float",
+        # Equipment terms
+        "marine equipment", "navigation equipment", "floating object"
+    ]
+    df_filtered = df[df['object_class'].isin(buoy_classes)]
+    
+    if len(df_filtered) == 0:
+        print("No buoy objects found in confidence data.")
+        df_plot = df  # Fall back to all data
+        plot_title_suffix = " (All Objects - No Buoys Found)"
+    else:
+        df_plot = df_filtered
+        plot_title_suffix = " (Buoys Only)"
+        print(f"Filtering to {len(df_filtered)} records from {len(buoy_classes)} buoy classes")
+    
+    # Create confidence vs time visualization
+    plt.figure(figsize=(15, 10))
+    
+    # Plot 1: Detection confidence over time grouped by object class
+    if 'detection_confidence' in df.columns:
+        plt.subplot(2, 2, 1)
+        detection_df = df_plot[df_plot['tracking_type'] == 'initial_detection']
+        
+        # Group by object class and combine data
+        for obj_class in detection_df['object_class'].unique():
+            class_data = detection_df[detection_df['object_class'] == obj_class]
+            # Sort by frame index to create smooth lines
+            class_data = class_data.sort_values('frame_idx')
+            plt.plot(class_data['frame_idx'], class_data['detection_confidence'], 
+                    marker='o', label=f'{obj_class}', alpha=0.7)
+            
+        plt.title(f'Detection Confidence Over Time{plot_title_suffix}')
+        plt.xlabel('Frame Index')
+        plt.ylabel('Detection Confidence')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(True)
+    
+    # Plot 2: SAM confidence over time grouped by object class
+    if 'sam_confidence' in df.columns:
+        plt.subplot(2, 2, 2)
+        sam_df = df_plot[df_plot['tracking_type'] == 'initial_detection']
+        
+        # Group by object class and combine data
+        for obj_class in sam_df['object_class'].unique():
+            class_data = sam_df[sam_df['object_class'] == obj_class]
+            # Sort by frame index to create smooth lines
+            class_data = class_data.sort_values('frame_idx')
+            plt.plot(class_data['frame_idx'], class_data['sam_confidence'], 
+                    marker='s', label=f'{obj_class}', alpha=0.7)
+            
+        plt.title(f'SAM Confidence Over Time{plot_title_suffix}')
+        plt.xlabel('Frame Index')
+        plt.ylabel('SAM Confidence')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(True)
+    
+    # Plot 3: Mask confidence during tracking grouped by object class
+    if 'mask_confidence' in df.columns:
+        plt.subplot(2, 2, 3)
+        tracking_df = df_plot[df_plot['tracking_type'] == 'propagation']
+        
+        # Group by object class and combine data
+        for obj_class in tracking_df['object_class'].unique():
+            class_data = tracking_df[tracking_df['object_class'] == obj_class]
+            # Sort by frame index to create smooth lines
+            class_data = class_data.sort_values('frame_idx')
+            plt.plot(class_data['frame_idx'], class_data['mask_confidence'], 
+                    marker='.', alpha=0.6, label=f'{obj_class}')
+            
+        plt.title(f'Mask Confidence During Tracking{plot_title_suffix}')
+        plt.xlabel('Frame Index')
+        plt.ylabel('Mask Confidence (Max Logit)')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(True)
+    
+    # Plot 4: Mask area over time grouped by object class
+    if 'mask_area' in df.columns:
+        plt.subplot(2, 2, 4)
+        tracking_df = df_plot[df_plot['tracking_type'] == 'propagation']
+        
+        # Group by object class and combine data
+        for obj_class in tracking_df['object_class'].unique():
+            class_data = tracking_df[tracking_df['object_class'] == obj_class]
+            # Sort by frame index to create smooth lines
+            class_data = class_data.sort_values('frame_idx')
+            plt.plot(class_data['frame_idx'], class_data['mask_area'], 
+                    marker='.', alpha=0.6, label=f'{obj_class}')
+            
+        plt.title(f'Mask Area Over Time{plot_title_suffix}')
+        plt.xlabel('Frame Index')
+        plt.ylabel('Mask Area (pixels)')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(True)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    confidence_plot_path = os.path.join(output_dir, "confidence_analysis.png")
+    plt.savefig(confidence_plot_path, dpi=300, bbox_inches='tight')
+    print(f"Confidence plot saved to: {confidence_plot_path}")
+    
+    # Print summary statistics
+    print("\n=== Confidence Analysis Summary ===")
+    print(f"Total confidence records: {len(df)}")
+    print(f"Unique objects tracked: {df['object_id'].nunique()}")
+    print(f"Frame range: {df['frame_idx'].min()} - {df['frame_idx'].max()}")
+    
+    # Show object classes detected
+    if 'object_class' in df.columns:
+        unique_classes = df['object_class'].unique()
+        print(f"Object classes detected: {', '.join(unique_classes)}")
+        
+        # Show count by class
+        class_counts = df.groupby('object_class')['object_id'].nunique().sort_values(ascending=False)
+        print("\nObjects per class:")
+        for class_name, count in class_counts.items():
+            print(f"  {class_name}: {count} objects")
+    
+    if 'detection_confidence' in df.columns:
+        det_df = df[df['tracking_type'] == 'initial_detection']
+        print(f"\nAverage detection confidence: {det_df['detection_confidence'].mean():.3f}")
+        print(f"Detection confidence range: {det_df['detection_confidence'].min():.3f} - {det_df['detection_confidence'].max():.3f}")
+        
+        # Show confidence by class
+        if 'object_class' in det_df.columns:
+            print("\nDetection confidence by class:")
+            class_conf = det_df.groupby('object_class')['detection_confidence'].agg(['mean', 'count']).round(3)
+            for class_name, stats in class_conf.iterrows():
+                print(f"  {class_name}: {stats['mean']:.3f} (n={stats['count']})")
+    
+    if 'mask_confidence' in df.columns:
+        track_df = df[df['tracking_type'] == 'propagation']
+        print(f"\nAverage tracking confidence: {track_df['mask_confidence'].mean():.3f}")
+        print(f"Tracking confidence range: {track_df['mask_confidence'].min():.3f} - {track_df['mask_confidence'].max():.3f}")
+    
+    print("\nConfidence analysis completed!")
+else:
+    print("No confidence data collected.")

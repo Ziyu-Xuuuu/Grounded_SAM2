@@ -14,6 +14,7 @@ from utils.mask_dictionary_model import MaskDictionaryModel, ObjectInfo
 import json
 import copy
 
+# This demo shows the continuous object tracking plus reverse tracking with Grounding DINO and SAM 2
 """
 Step 1: Environment settings and model initialization
 """
@@ -44,16 +45,22 @@ grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).
 
 # setup the input image and text prompt for SAM 2 and Grounding DINO
 # VERY important: text queries need to be lowercased + end with a dot
-text = "car."
+text = (
+    "red cone buoy. green cone buoy. gray cone buoy. black cone buoy. "
+    "black sphere buoy. orange sphere buoy. "
+    "colored navigation buoy. floating buoy. marker buoy. "
+    "floating object. floating obstacle. "
+    "boat. ship. vessel. "
+    "dock. pier. rocks. water. lake. sea. sky."
+)
 
 # `video_dir` a directory of JPEG frames with filenames like `<frame_index>.jpg`  
-video_dir = "notebooks/videos/car"
+video_dir = "vrx_demo"
 # 'output_dir' is the directory to save the annotated frames
-output_dir = "./outputs"
+output_dir = "vrx_demo_outputs"
 # 'output_video_path' is the path to save the final video
-output_video_path = "./outputs/output.mp4"
+output_video_path = "./vrx_demo_outputs/vrx_tracking_demo.mp4"
 # create the output directory
-CommonUtils.creat_dirs(output_dir)
 mask_data_dir = os.path.join(output_dir, "mask_data")
 json_data_dir = os.path.join(output_dir, "json_data")
 result_dir = os.path.join(output_dir, "result")
@@ -67,13 +74,13 @@ frame_names = [
 frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
 
 # init video predictor state
-inference_state = video_predictor.init_state(video_path=video_dir, offload_video_to_cpu=True, async_loading_frames=True)
+inference_state = video_predictor.init_state(video_path=video_dir)
 step = 20 # the step to sample frames for Grounding DINO predictor
 
 sam2_masks = MaskDictionaryModel()
 PROMPT_TYPE_FOR_VIDEO = "mask" # box, mask or point
 objects_count = 0
-
+frame_object_count = {}
 """
 Step 2: Prompt Grounding DINO and SAM image predictor to get the box and mask for all frames
 """
@@ -83,7 +90,7 @@ for start_frame_idx in range(0, len(frame_names), step):
     print("start_frame_idx", start_frame_idx)
     # continue
     img_path = os.path.join(video_dir, frame_names[start_frame_idx])
-    image = Image.open(img_path)
+    image = Image.open(img_path).convert("RGB")
     image_base_name = frame_names[start_frame_idx].split(".")[0]
     mask_dict = MaskDictionaryModel(promote_type = PROMPT_TYPE_FOR_VIDEO, mask_name = f"mask_{image_base_name}.npy")
 
@@ -108,6 +115,7 @@ for start_frame_idx in range(0, len(frame_names), step):
     # print("results[0]",results[0])
     OBJECTS = results[0]["labels"]
     if input_boxes.shape[0] != 0:
+
         # prompt SAM 2 image predictor to get the mask for the object
         masks, scores, logits = image_predictor.predict(
             point_coords=None,
@@ -122,7 +130,6 @@ for start_frame_idx in range(0, len(frame_names), step):
             logits = logits[None]
         elif masks.ndim == 4:
             masks = masks.squeeze(1)
-
         """
         Step 3: Register each object's positive points to video predictor
         """
@@ -132,23 +139,22 @@ for start_frame_idx in range(0, len(frame_names), step):
             mask_dict.add_new_frame_annotation(mask_list=torch.tensor(masks).to(device), box_list=torch.tensor(input_boxes), label_list=OBJECTS)
         else:
             raise NotImplementedError("SAM 2 video predictor only support mask prompts")
-
-
-        """
-        Step 4: Propagate the video predictor to get the segmentation results for each frame
-        """
-        objects_count = mask_dict.update_masks(tracking_annotation_dict=sam2_masks, iou_threshold=0.8, objects_count=objects_count)
-        print("objects_count", objects_count)
     else:
         print("No object detected in the frame, skip merge the frame merge {}".format(frame_names[start_frame_idx]))
         mask_dict = sam2_masks
 
+    """
+    Step 4: Propagate the video predictor to get the segmentation results for each frame
+    """
+    objects_count = mask_dict.update_masks(tracking_annotation_dict=sam2_masks, iou_threshold=0.8, objects_count=objects_count)
+    frame_object_count[start_frame_idx] = objects_count
+    print("objects_count", objects_count)
     
     if len(mask_dict.labels) == 0:
         mask_dict.save_empty_mask_and_json(mask_data_dir, json_data_dir, image_name_list = frame_names[start_frame_idx:start_frame_idx+step])
         print("No object detected in the frame, skip the frame {}".format(start_frame_idx))
         continue
-    else: 
+    else:
         video_predictor.reset_state(inference_state)
 
         for object_id, object_info in mask_dict.labels.items():
@@ -165,7 +171,7 @@ for start_frame_idx in range(0, len(frame_names), step):
             
             for i, out_obj_id in enumerate(out_obj_ids):
                 out_mask = (out_mask_logits[i] > 0.0) # .cpu().numpy()
-                object_info = ObjectInfo(instance_id = out_obj_id, mask = out_mask[0], class_name = mask_dict.get_target_class_name(out_obj_id))
+                object_info = ObjectInfo(instance_id = out_obj_id, mask = out_mask[0], class_name = mask_dict.get_target_class_name(out_obj_id), logit=mask_dict.get_target_logit(out_obj_id))
                 object_info.update_box()
                 frame_masks.labels[out_obj_id] = object_info
                 image_base_name = frame_names[out_frame_idx].split(".")[0]
@@ -189,15 +195,60 @@ for start_frame_idx in range(0, len(frame_names), step):
         mask_img = mask_img.numpy().astype(np.uint16)
         np.save(os.path.join(mask_data_dir, frame_masks_info.mask_name), mask_img)
 
-        json_data = frame_masks_info.to_dict()
         json_data_path = os.path.join(json_data_dir, frame_masks_info.mask_name.replace(".npy", ".json"))
-        with open(json_data_path, "w") as f:
-            json.dump(json_data, f)
+        frame_masks_info.to_json(json_data_path)
+       
+
+CommonUtils.draw_masks_and_box_with_supervision(video_dir, mask_data_dir, json_data_dir, result_dir)
+
+print("try reverse tracking")
+start_object_id = 0
+object_info_dict = {}
+for frame_idx, current_object_count in frame_object_count.items():
+    print("reverse tracking frame", frame_idx, frame_names[frame_idx])
+    if frame_idx != 0:
+        video_predictor.reset_state(inference_state)
+        image_base_name = frame_names[frame_idx].split(".")[0]
+        json_data_path = os.path.join(json_data_dir, f"mask_{image_base_name}.json")
+        json_data = MaskDictionaryModel().from_json(json_data_path)
+        mask_data_path = os.path.join(mask_data_dir, f"mask_{image_base_name}.npy")
+        mask_array = np.load(mask_data_path)
+        for object_id in range(start_object_id+1, current_object_count+1):
+            print("reverse tracking object", object_id)
+            object_info_dict[object_id] = json_data.labels[object_id]
+            video_predictor.add_new_mask(inference_state, frame_idx, object_id, mask_array == object_id)
+    start_object_id = current_object_count
+        
+    
+    for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state, max_frame_num_to_track=step*2,  start_frame_idx=frame_idx, reverse=True):
+        image_base_name = frame_names[out_frame_idx].split(".")[0]
+        json_data_path = os.path.join(json_data_dir, f"mask_{image_base_name}.json")
+        json_data = MaskDictionaryModel().from_json(json_data_path)
+        mask_data_path = os.path.join(mask_data_dir, f"mask_{image_base_name}.npy")
+        mask_array = np.load(mask_data_path)
+        # merge the reverse tracking masks with the original masks
+        for i, out_obj_id in enumerate(out_obj_ids):
+            out_mask = (out_mask_logits[i] > 0.0).cpu()
+            if out_mask.sum() == 0:
+                print("no mask for object", out_obj_id, "at frame", out_frame_idx)
+                continue
+            object_info = object_info_dict[out_obj_id]
+            object_info.mask = out_mask[0]
+            object_info.update_box()
+            json_data.labels[out_obj_id] = object_info
+            mask_array = np.where(mask_array != out_obj_id, mask_array, 0)
+            mask_array[object_info.mask] = out_obj_id
+        
+        np.save(mask_data_path, mask_array)
+        json_data.to_json(json_data_path)
+
+        
+
 
 
 """
 Step 6: Draw the results and save the video
 """
-CommonUtils.draw_masks_and_box_with_supervision(video_dir, mask_data_dir, json_data_dir, result_dir)
+CommonUtils.draw_masks_and_box_with_supervision(video_dir, mask_data_dir, json_data_dir, result_dir+"_reverse")
 
 create_video_from_images(result_dir, output_video_path, frame_rate=15)
